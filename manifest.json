@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "id": "artemisa81.gtasks",
+  "name": "Google Tasks",
+  "version": "0.1.0",
+  "author": "artemisa81",
+  "license": "MIT",
+  "description": "Keyboard-driven Google Tasks panel. Add, edit, complete, reorder and delete tasks without leaving the keyboard; renders from a local cache so it opens instantly and follows every Omarchy theme.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Tasks",
+    "description": "Open-task count in the bar; a TUI-style task panel with add / edit / complete / delete on j/k, enter, a, e, d.",
+    "category": "Productivity",
+    "aliases": [
+      "tasks",
+      "gtasks",
+      "todo",
+      "google-tasks",
+      "google tasks"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelWidth": 460,
+      "showCompleted": true,
+      "autoRefreshSec": 90,
+      "showHints": true
+    },
+    "schema": [
+      {
+        "key": "panelWidth",
+        "type": "integer",
+        "label": "Panel width (px)",
+        "min": 300,
+        "max": 900,
+        "step": 10,
+        "defaultValue": 460
+      },
+      {
+        "key": "showCompleted",
+        "type": "boolean",
+        "label": "Show completed tasks at the bottom of the list",
+        "defaultValue": true
+      },
+      {
+        "key": "autoRefreshSec",
+        "type": "integer",
+        "label": "Background refresh while open (seconds, 0 = off)",
+        "min": 0,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 90
+      },
+      {
+        "key": "showHints",
+        "type": "boolean",
+        "label": "Show the keybinding hints line in the panel footer",
+        "defaultValue": true
+      }
+    ]
+  }
+}
