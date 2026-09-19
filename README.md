@@ -96,9 +96,25 @@ parent surface, so a keyboard-driven panel summoned from IPC or a keybind
 opens without focus and its focus grab clears immediately, closing it again.
 `KeyboardPanel` primes layer-shell keyboard focus on every open.
 
+`Tasks.js` is pure and Qt-free, so it is unit-tested under node:
+
+```sh
+node --test tests/tasks.test.js
+```
+
 Edits under `~/.config/omarchy/plugins/` are meant to hot-reload, but changes
 here did not always take effect until `omarchy restart shell`. If a change
 appears to do nothing, restart the shell before believing the code is wrong.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| "gws CLI not found" | `gws` is not on `PATH`. Install it (the calendar plugin uses the same tool). |
+| "Google authorization needed" | The OAuth token expired or the profile is missing. Run the setup again from the panel. |
+| "Google Tasks API not enabled yet" | Enable the Tasks API on your GCP project, then retry. |
+| Panel opens but keys do nothing | It is in filter mode without focus. Click a field, or press `Esc`. |
+| A deleted list still shows in the count | Should not happen since the list cache is pruned on each sync; press `r` to force one. |
 
 ## Requirements
 

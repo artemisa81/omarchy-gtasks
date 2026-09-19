@@ -1,0 +1,7 @@
+# Editor and OS noise
+.DS_Store
+*~
+*.swp
+
+# Node, if the test suite is run with anything that writes a lockfile
+node_modules/

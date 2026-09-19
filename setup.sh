@@ -5,6 +5,10 @@
 # reusing an OAuth client secret from an existing gws profile when one exists.
 set -euo pipefail
 
+# The profile holds OAuth tokens and a client secret; keep them owner-only even
+# under a permissive umask.
+umask 077
+
 PROFILE="${HOME}/.config/gws-omarchy-tasks"
 SCOPE="https://www.googleapis.com/auth/tasks"
 TASKS_API_URL="https://console.cloud.google.com/apis/library/tasks.googleapis.com"

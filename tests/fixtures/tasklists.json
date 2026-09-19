@@ -1,0 +1,7 @@
+{
+  "kind": "tasks#taskLists",
+  "items": [
+    { "id": "LIST_A", "title": "My Tasks", "updated": "2026-08-25T10:00:00.000Z" },
+    { "id": "LIST_B", "title": "Work", "updated": "2026-08-25T10:00:00.000Z" }
+  ]
+}

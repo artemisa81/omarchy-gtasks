@@ -1,0 +1,3 @@
+{"kind":"tasks#tasks","items":[{"id":"a","title":"Draft the memo","notes":"keep $20K and row 42","status":"needsAction","due":"2026-08-25T00:00:00.000Z","position":"00000000000000000001","updated":"2026-08-20T10:00:00.000Z"},{"id":"b","title":"Call the vendor","status":"needsAction","position":"00000000000000000002"},{"id":"c","title":"Send invoice 88231","status":"completed","position":"00000000000000000003"}]}
+{"kind":"tasks#tasks","items":[{"id":"d","title":"Subtask of a","parent":"a","status":"needsAction","position":"00000000000000000004"},{"id":"e","title":"Deleted task","status":"needsAction","position":"00000000000000000005","deleted":true}]}
+this line is not json and must be skipped

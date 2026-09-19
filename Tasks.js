@@ -138,14 +138,12 @@ function buildRows(tasks, opts) {
 
     var open = []
     var done = []
-    var matches = {}
     for (var j = 0; j < tasks.length; j++) {
         var t = tasks[j]
         if (filter !== "") {
             var hay = (t.title + "\n" + t.notes).toLowerCase()
             if (hay.indexOf(filter) === -1) continue
         }
-        matches[t.id] = true
         ;(t.status === "completed" ? done : open).push(t)
     }
 

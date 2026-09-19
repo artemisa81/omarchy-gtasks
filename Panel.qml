@@ -43,6 +43,9 @@ Panel {
   // Set as soon as any sync has been kicked off, so the startup sync below
   // stands down if the panel was opened before it got its turn.
   property bool primed: false
+  // Guards refreshAll so the auto-refresh timer, a manual `r`, and the startup
+  // prime cannot stack three list fetches on top of each other.
+  property bool fetchInFlight: false
 
   property bool calendarOpen: false
   property int calYear: new Date().getFullYear()
@@ -87,7 +90,14 @@ Panel {
 
   onOpenedChanged: {
     if (!opened) {
+      // Reset the transient modes as well as the editor. Leaving help/confirm/
+      // calendar/filter set brought the overlay back on the next open, and a
+      // filter mode reopened with neither the key handler nor a focused field,
+      // so the panel looked dead until something was clicked.
       cancelEditing()
+      mode = "normal"
+      confirmKind = ""
+      calendarOpen = false
       return
     }
     pendingG = false
@@ -192,16 +202,19 @@ Panel {
     var out = lastOut
     var err = lastErr
 
-    if (exitCode !== 0) classifyError(err + " " + out)
+    if (exitCode !== 0) classifyError(err + " " + out, exitCode)
     if (op && typeof op.onDone === "function") {
       try { op.onDone(exitCode, out, err) } catch (e) { console.warn("gtasks:", e) }
     }
     drainQueue()
   }
 
-  function classifyError(text) {
+  function classifyError(text, exitCode) {
     var t = String(text || "")
-    if (/accessNotConfigured|has not been used|is disabled/i.test(t)) {
+    if (exitCode === 127 || /\bgws\b[^\n]*(not found|no such file)|command not found/i.test(t)) {
+      notice = "gws CLI not found — install it, then retry (see the README)"
+      noticeIsError = true
+    } else if (/accessNotConfigured|has not been used|is disabled/i.test(t)) {
       apiDisabled = true
       authNeeded = true
       notice = "Google Tasks API not enabled yet"
@@ -218,13 +231,15 @@ Panel {
     id: apiProc
     environment: ({ "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": root.profileDir })
     command: ["true"]
-    stdout: StdioCollector {
-      onStreamFinished: root.lastOut = text
+    // waitForEnd makes the collectors finish before onExited runs, so finishOp
+    // always sees this process's own output rather than the previous one's.
+    stdout: StdioCollector { id: apiStdout; waitForEnd: true }
+    stderr: StdioCollector { id: apiStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.lastOut = apiStdout.text
+      root.lastErr = apiStderr.text
+      root.finishOp(exitCode)
     }
-    stderr: StdioCollector {
-      onStreamFinished: root.lastErr = text
-    }
-    onExited: function(exitCode) { root.finishOp(exitCode) }
   }
 
   Process {
@@ -235,9 +250,11 @@ Panel {
   // ------------------------------------------------------------- fetching
 
   function fetchLists() {
+    fetchInFlight = true
     enqueue({
       argv: ["gws", "tasks", "tasklists", "list"],
       onDone: function(code, out, err) {
+        fetchInFlight = false
         if (code !== 0) {
           if (!authNeeded) { notice = "Could not load task lists"; noticeIsError = true }
           return
@@ -251,6 +268,14 @@ Panel {
         lastSyncedAt = Date.now()
         var wanted = currentListId
         lists = ls
+        // Drop tasks for lists that no longer exist. Without this a list
+        // deleted in Google stays in the model forever: the bar keeps counting
+        // its tasks and alerts keep firing for them.
+        var keep = {}
+        for (var k = 0; k < ls.length; k++) keep[ls[k].id] = true
+        var pruned = {}
+        for (var oldId in tasksByList) if (keep[oldId]) pruned[oldId] = tasksByList[oldId]
+        tasksByList = pruned
         var found = false
         for (var i = 0; i < ls.length; i++) {
           if (ls[i].id === wanted) { listIndex = i; found = true; break }
@@ -291,6 +316,7 @@ Panel {
 
   function refreshAll() {
     if (!hasSecret) return
+    if (fetchInFlight) return
     primed = true
     notice = ""
     fetchLists()
@@ -586,6 +612,15 @@ Panel {
   // Every timed, still-open task gets exactly one desktop notification when its
   // moment arrives; `notifiedIds` rides along in the cache so a shell restart
   // does not replay them.
+  // Key-order-independent comparison so a rebuilt object with identical
+  // contents does not trigger a cache write every 30 seconds.
+  function sameNotified(a, b) {
+    var ka = Object.keys(a), kb = Object.keys(b)
+    if (ka.length !== kb.length) return false
+    for (var i = 0; i < ka.length; i++) if (b[ka[i]] !== a[ka[i]]) return false
+    return true
+  }
+
   function checkAlerts() {
     // Before the cache has been applied there is nothing to check, and saving
     // from here would overwrite the cache with an empty model.
@@ -621,7 +656,7 @@ Panel {
 
     // Rebuilt from the live tasks each pass, so records for deleted tasks and
     // for times that have been removed fall out on their own.
-    if (JSON.stringify(next) !== JSON.stringify(notifiedIds)) {
+    if (!sameNotified(next, notifiedIds)) {
       notifiedIds = next
       saveCache()
     }
@@ -834,18 +869,9 @@ Panel {
 
   function launchSetup() {
     var scriptPath = decodeURIComponent(Qt.resolvedUrl("setup.sh").toString().replace(/^file:\/\//, ""))
-    var cmd = "omarchy-launch-tui --app-id=org.omarchy.gtasks-setup bash " + scriptPath
-    if (root.bar && typeof root.bar.run === "function") {
-      root.bar.run(cmd)
-    } else {
-      setupProc.command = ["sh", "-c", cmd]
-      setupProc.running = true
-    }
-  }
-
-  Process {
-    id: setupProc
-    command: ["true"]
+    // An argv vector, not a shell string: a HOME containing a space or a quote
+    // would otherwise break the command or inject into it.
+    Util.execArgv(["omarchy-launch-tui", "--app-id=org.omarchy.gtasks-setup", "bash", scriptPath])
   }
 
   // ------------------------------------------------------------- popup surface
@@ -901,8 +927,9 @@ Panel {
         }
 
         if (root.mode === "confirm") {
-          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.confirmAction(); event.accepted = true }
-          else if (event.key === Qt.Key_Escape) { root.cancelConfirm(); event.accepted = true }
+          // Delegate to the first-party dialog so arrows/Tab move the selection
+          // and Enter acts on whichever button is highlighted.
+          if (confirmDialog.handleKey(event)) event.accepted = true
           return
         }
 
@@ -1111,10 +1138,14 @@ Panel {
               }
             }
             Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Escape) {
+              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 root.stopFilter()
                 event.accepted = true
               } else if (event.key === Qt.Key_Escape) {
+                // Esc clears the filter and leaves filter mode; Enter keeps the
+                // filter and just returns focus to the list.
+                root.clearFilter()
+                root.stopFilter()
                 event.accepted = true
               }
             }
@@ -1405,7 +1436,9 @@ Panel {
                 verticalPadding: Style.spacing.xs
                 placeholderText: "due date  ↓ calendar"
                 font.pixelSize: Style.font.bodySmall
-                inputMethodHints: Qt.ImhDigitsOnly
+                // Not ImhDigitsOnly: the field wants YYYY-MM-DD, and a digits
+                // hint makes virtual keyboards refuse the dashes.
+                inputMethodHints: Qt.ImhNone
                 Keys.onPressed: function(event) {
                   if (event.key === Qt.Key_Escape) { root.cancelEditing(); event.accepted = true }
                   else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.commitEditing(); event.accepted = true }
@@ -1601,76 +1634,22 @@ Panel {
         }
       }
 
-      Rectangle {
-        id: confirmOverlay
+      // The first-party dialog, rather than a hand-rolled overlay: it owns its
+      // own focus, arrow/Tab selection and scrim-click-to-cancel.
+      ConfirmDialog {
+        id: confirmDialog
         anchors.fill: parent
-        visible: root.mode === "confirm"
-        color: Qt.alpha(Color.background, 0.72)
-        radius: Style.cornerRadius
-
-        Column {
-          anchors.centerIn: parent
-          spacing: Style.spacing.lg
-
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: root.confirmKind === "delete"
-              ? "Delete this task?"
-              : "Permanently clear completed tasks?"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Row {
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.spacing.sm
-
-            Rectangle {
-              width: Style.space(86)
-              height: Style.spacing.controlHeight
-              radius: Style.cornerRadius / 2
-              color: maYes.containsMouse ? Qt.alpha(Color.urgent, 0.28) : Qt.alpha(Color.urgent, 0.16)
-              Text {
-                anchors.centerIn: parent
-                text: "Yes (↵)"
-                color: Color.urgent
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-              MouseArea {
-                id: maYes
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.confirmAction()
-              }
-            }
-
-            Rectangle {
-              width: Style.space(86)
-              height: Style.spacing.controlHeight
-              radius: Style.cornerRadius / 2
-              color: maNo.containsMouse ? Style.hoverFill : "transparent"
-              border.width: Style.normalBorderWidth
-              border.color: Style.normalBorderColor
-              Text {
-                anchors.centerIn: parent
-                text: "No (Esc)"
-                color: Color.popups.text
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-              MouseArea {
-                id: maNo
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.cancelConfirm()
-              }
-            }
-          }
-        }
+        opened: root.mode === "confirm"
+        message: root.confirmKind === "delete"
+          ? "Delete this task?"
+          : "Permanently clear completed tasks?"
+        confirmText: root.confirmKind === "delete" ? "Delete" : "Clear"
+        cancelText: "Cancel"
+        background: Color.background
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onConfirmed: root.confirmAction()
+        onCanceled: root.cancelConfirm()
       }
 
       Rectangle {

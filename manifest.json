@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "artemisa81.gtasks",
   "name": "Google Tasks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "artemisa81",
   "license": "MIT",
   "description": "Keyboard-driven Google Tasks panel. Add, edit, complete, reorder and delete tasks without leaving the keyboard; renders from a local cache so it opens instantly and follows every Omarchy theme.",
