@@ -1646,8 +1646,8 @@ Panel {
         confirmText: root.confirmKind === "delete" ? "Delete" : "Clear"
         cancelText: "Cancel"
         background: Color.background
-        foreground: root.foreground
-        fontFamily: root.fontFamily
+        foreground: Color.popups.text
+        fontFamily: Style.font.family
         onConfirmed: root.confirmAction()
         onCanceled: root.cancelConfirm()
       }
