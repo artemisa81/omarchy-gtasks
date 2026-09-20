@@ -49,21 +49,25 @@ automatically.
   web. The one exception is clearing a due date, which patch cannot express
   (`due: null` is ignored), so that single case uses update deliberately.
 
-## One-time setup
+## Google sign-in
 
-Google Tasks requires OAuth authorization. Run:
+Google Tasks uses **GNOME Online Accounts**, the same account broker used by
+GNOME Calendar and the Omarchy calendar plugin. Open the panel and click
+**Add Google account**. The GNOME account window shows Google's own consent
+screen, and the panel starts syncing when the account appears.
 
-```
-omarchy-launch-tui --app-id=org.omarchy.gtasks-setup bash ~/.config/omarchy/plugins/artemisa81.gtasks/setup.sh
-```
+This flow does not require a Google Cloud project, API keys, a client secret,
+or the `gws` CLI. GNOME Online Accounts owns the refresh token and secure
+storage; the plugin only holds a short-lived access token in memory while it
+is making a request. The Google provider's Tasks scope is used for the Tasks
+API.
 
-or click "Sign in with Google" in the panel. The script creates a dedicated
-`gws` CLI profile at `~/.config/gws-omarchy-tasks` with the
-`https://www.googleapis.com/auth/tasks` scope, reusing an existing OAuth
-client secret from the calendar plugin profile when present.
+The following system packages must be installed:
 
-If your GCP project has never used Tasks, enable the API when prompted:
-https://console.cloud.google.com/apis/library/tasks.googleapis.com
+- `gnome-online-accounts`
+- `gnome-online-accounts-gtk`
+- `python`
+- `systemd` (`busctl`)
 
 The panel also opens via IPC, e.g. bound to a key in Hyprland:
 
@@ -84,7 +88,6 @@ editable from the widget settings UI.
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/gws-omarchy-tasks/` | OAuth credentials (created by setup) |
 | `~/.cache/omarchy-gtasks/cache.json` | Last synced lists + tasks |
 | `~/.cache/omarchy-gtasks/state.json` | Panel state, written by the `state` IPC call |
 
@@ -110,13 +113,13 @@ appears to do nothing, restart the shell before believing the code is wrong.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| "gws CLI not found" | `gws` is not on `PATH`. Install it (the calendar plugin uses the same tool). |
-| "Google authorization needed" | The OAuth token expired or the profile is missing. Run the setup again from the panel. |
-| "Google Tasks API not enabled yet" | Enable the Tasks API on your GCP project, then retry. |
+| "GNOME Online Accounts is unavailable" | Install `gnome-online-accounts` and `gnome-online-accounts-gtk`, then restart the shell. |
+| "Google authorization needed" | Reconnect the account in GNOME Online Accounts, then press Retry in the panel. |
+| "No Google account connected" | Open the panel and click **Add Google account**. |
 | Panel opens but keys do nothing | It is in filter mode without focus. Click a field, or press `Esc`. |
 | A deleted list still shows in the count | Should not happen since the list cache is pruned on each sync; press `r` to force one. |
 
 ## Requirements
 
-- `gws` on PATH (same CLI the tmn73.calendar plugin uses)
-- A Google account; up to ~300 tasks per list are fetched per refresh
+- GNOME Online Accounts with a connected Google account
+- A Google account; up to 300 tasks per list are fetched per refresh

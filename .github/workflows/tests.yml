@@ -14,11 +14,13 @@ jobs:
         with:
           node-version: 20
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
-      - name: Lint the setup script
-        run: shellcheck -S warning setup.sh
+        run: sudo apt-get update && sudo apt-get install -y jq
       - name: Run the Tasks.js unit tests
         run: node --test tests/tasks.test.js
+      - name: Run the GOA backend tests
+        run: python3 -m unittest discover -s tests -p 'test_goa_tasks.py' -v
+      - name: Compile the GOA backend
+        run: python3 -m py_compile bin/goa-tasks
       - name: Validate the plugin manifest
         run: |
           if command -v omarchy-plugin-validate >/dev/null 2>&1; then

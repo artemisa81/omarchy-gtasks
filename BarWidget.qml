@@ -9,7 +9,7 @@ BarWidget {
   moduleName: "artemisa81.gtasks"
 
   readonly property var counts: panelLoader.item ? panelLoader.item.counts : ({ open: 0, total: 0 })
-  readonly property bool needsAuth: panelLoader.item ? panelLoader.item.authNeeded || !panelLoader.item.hasSecret : false
+  readonly property bool needsAuth: panelLoader.item ? panelLoader.item.authNeeded || !panelLoader.item.hasAccount : false
   readonly property string glyph: "\uf0ae"
 
   readonly property string displayText: {

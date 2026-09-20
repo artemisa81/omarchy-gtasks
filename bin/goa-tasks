@@ -1,0 +1,362 @@
+#!/usr/bin/python3 -IXutf8
+"""Google Tasks backend using GNOME Online Accounts.
+
+The shell talks to this process through a small argv contract. GOA owns the
+Google client, refresh token, account list, and token refresh; this process only
+holds one access token in memory while making a bounded Tasks API request.
+"""
+
+import json
+import os
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+API = "https://tasks.googleapis.com/tasks/v1"
+GOA = "org.gnome.OnlineAccounts"
+GOA_ROOT = "/org/gnome/OnlineAccounts"
+BUSCTL = "/usr/bin/busctl"
+USER_AGENT = "artemisa81.gtasks/0.3.0 (Omarchy)"
+
+BUSCTL_TIMEOUT = 30
+REQUEST_TIMEOUT = 30
+MAX_BUSCTL_BYTES = 4 * 1024 * 1024
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_PAGES = 20
+MAX_PAGE_ITEMS = 5000
+MAX_PAYLOAD_BYTES = 1024 * 1024
+MAX_ID_LENGTH = 512
+RETRY_STATUSES = (429, 500, 502, 503)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never carry a bearer token across an HTTP redirect."""
+
+    def redirect_request(self, request, file, code, message, headers, new_url):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            code,
+            "redirect refused for a token-bearing request",
+            headers,
+            file,
+        )
+
+
+_tls = ssl.create_default_context()
+_tls.minimum_version = ssl.TLSVersion.TLSv1_2
+_opener = urllib.request.build_opener(
+    _NoRedirect(), urllib.request.HTTPSHandler(context=_tls)
+)
+_tokens = {}
+
+
+def _run_busctl(*args):
+    process = subprocess.Popen(
+        [BUSCTL, "--user", "--json=short", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        raw, _ = process.communicate(timeout=BUSCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise RuntimeError("GNOME Online Accounts did not respond")
+    if process.returncode != 0:
+        raise RuntimeError("GNOME Online Accounts is unavailable")
+    if len(raw) > MAX_BUSCTL_BYTES:
+        raise RuntimeError("GNOME Online Accounts returned too much data")
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GNOME Online Accounts returned invalid data") from exc
+
+
+def _value(properties, name):
+    value = properties.get(name, {})
+    return value.get("data") if isinstance(value, dict) else None
+
+
+def _records_from_objects(objects):
+    records = []
+    for path, interfaces in objects.items():
+        account = interfaces.get(GOA + ".Account")
+        if not isinstance(account, dict) or _value(account, "ProviderType") != "google":
+            continue
+        email = _value(account, "PresentationIdentity") or _value(account, "Identity")
+        if not isinstance(email, str) or not email or len(email) > MAX_ID_LENGTH:
+            continue
+        if any(ord(char) < 32 or ord(char) == 127 for char in email):
+            continue
+        records.append({"email": email, "path": path})
+    return sorted(records, key=lambda record: record["email"].casefold())
+
+
+def goa_accounts():
+    reply = _run_busctl(
+        "call",
+        GOA,
+        GOA_ROOT,
+        "org.freedesktop.DBus.ObjectManager",
+        "GetManagedObjects",
+    )
+    data = reply.get("data")
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return []
+    return _records_from_objects(data[0])
+
+
+def _account():
+    records = goa_accounts()
+    if not records:
+        raise RuntimeError("No Google account connected in GNOME Online Accounts")
+    wanted = os.environ.get("GOOGLE_TASKS_ACCOUNT", "").strip()
+    if wanted:
+        for record in records:
+            if record["email"] == wanted:
+                return record
+        raise RuntimeError("Google account is not connected in GNOME Online Accounts")
+    return records[0]
+
+
+def access_token(record):
+    email = record["email"]
+    if email in _tokens:
+        return _tokens[email]
+    reply = _run_busctl(
+        "call",
+        GOA,
+        record["path"],
+        GOA + ".OAuth2Based",
+        "GetAccessToken",
+    )
+    data = reply.get("data")
+    token = data[0] if isinstance(data, list) and data else ""
+    if not isinstance(token, str) or not token or len(token) > MAX_ID_LENGTH:
+        raise RuntimeError("GNOME Online Accounts did not provide an access token")
+    _tokens[email] = token
+    return token
+
+
+def _bounded_body(response):
+    raw = bytearray()
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        raw.extend(chunk)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RuntimeError("Google Tasks response is too large")
+    return bytes(raw)
+
+
+def request(url, token, payload=None, method=None, retried=False):
+    if not url.startswith(API + "/"):
+        raise RuntimeError("Refusing request outside the Google Tasks API")
+    body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else None
+    headers = {"Authorization": "Bearer " + token, "User-Agent": USER_AGENT}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with _opener.open(req, timeout=REQUEST_TIMEOUT) as response:
+            raw = _bounded_body(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2048).decode("utf-8", errors="replace")[:400]
+        if not retried and exc.code in RETRY_STATUSES and (method in (None, "GET") or exc.code == 429):
+            time.sleep(1.0)
+            return request(url, token, payload, method, retried=True)
+        raise RuntimeError("Google Tasks returned %d: %s" % (exc.code, detail))
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Google Tasks returned invalid JSON") from exc
+
+
+def _query(params):
+    converted = {}
+    for key, value in (params or {}).items():
+        if isinstance(value, bool):
+            converted[key] = "true" if value else "false"
+        else:
+            converted[key] = str(value)
+    return urllib.parse.urlencode(converted)
+
+
+def api(record, path, params=None, payload=None, method=None):
+    url = API + path
+    query = _query(params)
+    if query:
+        url += "?" + query
+    return request(url, access_token(record), payload, method)
+
+
+def _id(params, name):
+    value = params.get(name)
+    if not isinstance(value, str) or not value or len(value) > MAX_ID_LENGTH:
+        raise RuntimeError("Missing or invalid " + name)
+    return urllib.parse.quote(value, safe="")
+
+
+def _json_option(argv, name, default):
+    if name not in argv:
+        return default
+    index = argv.index(name)
+    if index + 1 >= len(argv):
+        raise RuntimeError("Missing value for " + name)
+    if len(argv[index + 1].encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise RuntimeError(name + " is too large")
+    try:
+        value = json.loads(argv[index + 1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid JSON for " + name) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(name + " must contain an object")
+    return value
+
+
+def _task_pages(record, tasklist, params, limit):
+    pages = []
+    next_token = None
+    for _ in range(min(MAX_PAGES, max(1, limit))):
+        query = dict(params)
+        query.pop("tasklist", None)
+        query["maxResults"] = min(100, int(query.get("maxResults", 100)))
+        if next_token:
+            query["pageToken"] = next_token
+        page = api(record, "/lists/" + tasklist + "/tasks", query)
+        pages.append(page)
+        items = page.get("items", []) if isinstance(page, dict) else []
+        if not isinstance(items, list) or len(items) > MAX_PAGE_ITEMS:
+            raise RuntimeError("Google Tasks returned too many tasks")
+        next_token = page.get("nextPageToken") if isinstance(page, dict) else None
+        if not next_token:
+            break
+    if next_token:
+        raise RuntimeError("Google Tasks returned too many pages")
+    return pages
+
+
+def main(argv):
+    if not argv or argv[0] == "status":
+        return {"accounts": [record["email"] for record in goa_accounts()]}
+
+    if len(argv) < 2:
+        raise RuntimeError("Expected a resource and method")
+    resource, method = argv[0], argv[1]
+    params = _json_option(argv, "--params", {})
+    payload = _json_option(argv, "--json", None)
+    record = _account()
+
+    if resource == "tasklists" and method == "list":
+        pages = _tasklist_pages(record)
+        items = []
+        for page in pages:
+            items.extend(page.get("items", []))
+        return {"kind": "tasks#taskLists", "items": items}
+
+    if resource != "tasks":
+        raise RuntimeError("Unknown resource: " + resource)
+
+    if method == "list":
+        tasklist = _id(params, "tasklist")
+        pages = _task_pages(record, tasklist, params, _page_limit(argv))
+        return pages if "--page-all" in argv else pages[0]
+
+    tasklist = _id(params, "tasklist")
+    base = "/lists/" + tasklist
+    if method == "insert":
+        if payload is None:
+            raise RuntimeError("Missing task payload")
+        return api(record, base + "/tasks", None, payload, "POST")
+
+    task = _id(params, "task")
+    if method in ("patch", "update"):
+        if payload is None:
+            raise RuntimeError("Missing task payload")
+        verb = "PATCH" if method == "patch" else "PUT"
+        return api(record, base + "/tasks/" + task, None, payload, verb)
+    if method == "delete":
+        api(record, base + "/tasks/" + task, None, None, "DELETE")
+        return {}
+    if method == "clear":
+        api(record, base + "/clear", None, None, "POST")
+        return {}
+    if method == "move":
+        move_params = {}
+        for key in ("parent", "previous"):
+            if key in params:
+                move_params[key] = params[key]
+        api(record, base + "/tasks/" + task + "/move", move_params, None, "POST")
+        return {}
+    raise RuntimeError("Unknown tasks method: " + method)
+
+
+def _page_limit(argv):
+    if "--page-limit" not in argv:
+        return 1
+    index = argv.index("--page-limit")
+    if index + 1 >= len(argv):
+        raise RuntimeError("Missing value for --page-limit")
+    try:
+        value = int(argv[index + 1])
+    except ValueError as exc:
+        raise RuntimeError("Invalid --page-limit") from exc
+    if value < 1 or value > MAX_PAGES:
+        raise RuntimeError("Invalid --page-limit")
+    return value
+
+
+def _tasklist_pages(record):
+    pages = []
+    next_token = None
+    for _ in range(MAX_PAGES):
+        params = {"maxResults": 100}
+        if next_token:
+            params["pageToken"] = next_token
+        page = api(record, "/users/@me/lists", params)
+        pages.append(page)
+        next_token = page.get("nextPageToken") if isinstance(page, dict) else None
+        if not next_token:
+            return pages
+    raise RuntimeError("Google Tasks returned too many task-list pages")
+
+
+def _deadline(signum, frame):
+    print(json.dumps({"error": "Google Tasks backend timed out"}))
+    os._exit(1)
+
+
+def emit(result):
+    if isinstance(result, list):
+        lines = [json.dumps(page, separators=(",", ":")) for page in result]
+        text = "\n".join(lines)
+    else:
+        text = json.dumps(result, separators=(",", ":"))
+    if len(text.encode()) > MAX_OUTPUT_BYTES:
+        raise RuntimeError("Google Tasks output is too large")
+    print(text)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(120)
+    try:
+        emit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(1)
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)[:2000]}))
+        sys.exit(1)
+    finally:
+        signal.alarm(0)

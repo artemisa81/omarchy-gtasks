@@ -16,8 +16,10 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string profileDir: home + "/.config/gws-omarchy-tasks"
   readonly property string cacheDir: home + "/.cache/omarchy-gtasks"
+  readonly property string backendPath: decodeURIComponent(
+    Qt.resolvedUrl("bin/goa-tasks").toString().replace(/^file:\/\//, ""))
+  readonly property var backendCommand: ["/usr/bin/python3", "-I", "-X", "utf8", backendPath]
 
   readonly property int panelWidth: Math.max(300, Number(setting("panelWidth", 460)) || 460)
   readonly property bool showCompletedSetting: setting("showCompleted", true) === true
@@ -30,14 +32,16 @@ Panel {
   property var lists: []
   property int listIndex: 0
   property var tasksByList: ({})
+  property var accounts: []
   property string filterText: ""
   property int cursor: 0
   property string mode: "normal"
   property string confirmKind: ""
   property bool authNeeded: false
-  property bool apiDisabled: false
   property string notice: ""
   property bool noticeIsError: false
+  property bool authChecking: false
+  property bool loginPending: false
   property real lastSyncedAt: 0
   property bool pendingG: false
   // Set as soon as any sync has been kicked off, so the startup sync below
@@ -77,8 +81,8 @@ Panel {
   readonly property var counts: Tasks.totals(tasksByList)
   readonly property bool noDataYet: counts.total === 0 && lists.length === 0
 
-  readonly property bool hasSecret: secretFile.loaded === true
-  readonly property bool ready: hasSecret && !authNeeded
+  readonly property bool hasAccount: accounts.length > 0
+  readonly property bool ready: hasAccount && !authNeeded
 
   readonly property bool editing: mode === "add" || mode === "edit"
 
@@ -90,6 +94,7 @@ Panel {
 
   onOpenedChanged: {
     if (!opened) {
+      loginPending = false
       // Reset the transient modes as well as the editor. Leaving help/confirm/
       // calendar/filter set brought the overlay back on the next open, and a
       // filter mode reopened with neither the key handler nor a focused field,
@@ -101,7 +106,11 @@ Panel {
       return
     }
     pendingG = false
-    if (!hasSecret) return
+    if (!hasAccount) {
+      root.refreshAuth()
+      return
+    }
+    if (authNeeded) return
     if (autoRefreshSec > 0 || lastSyncedAt === 0) refreshAll()
     Qt.callLater(function() { if (mode === "normal") keyItem.forceActiveFocus() })
   }
@@ -114,12 +123,13 @@ Panel {
     id: primeSyncTimer
     interval: 2500
     repeat: false
-    running: root.hasSecret && !root.primed
+    running: root.hasAccount && !root.primed
     onTriggered: root.refreshAll()
   }
 
   Component.onCompleted: {
     mkdirProc.running = true
+    root.refreshAuth()
   }
 
   // ------------------------------------------------------------- data io
@@ -160,13 +170,6 @@ Panel {
     printErrors: false
     onLoaded: root.applyCache(text())
     onLoadFailed: root.applyCache("")
-  }
-
-  FileView {
-    id: secretFile
-    path: root.profileDir + "/client_secret.json"
-    watchChanges: true
-    printErrors: false
   }
 
   // ------------------------------------------------------------- process queue
@@ -211,25 +214,59 @@ Panel {
 
   function classifyError(text, exitCode) {
     var t = String(text || "")
-    if (exitCode === 127 || /\bgws\b[^\n]*(not found|no such file)|command not found/i.test(t)) {
-      notice = "gws CLI not found — install it, then retry (see the README)"
-      noticeIsError = true
-    } else if (/accessNotConfigured|has not been used|is disabled/i.test(t)) {
-      apiDisabled = true
+    if (/GNOME Online Accounts|No Google account|access token|not connected/i.test(t)) {
       authNeeded = true
-      notice = "Google Tasks API not enabled yet"
+      notice = "Google authorization needed"
       noticeIsError = true
-    } else if (/insufficient authentication scopes|invalid_grant|unauthorized_client|invalid_client|no credentials|401|403/i.test(t)) {
+    } else if (exitCode === 127 || /command not found|No such file/i.test(t)) {
+      notice = "Google Tasks backend is unavailable"
+      noticeIsError = true
+    } else if (/insufficient|invalid_grant|unauthorized|401|403/i.test(t)) {
       authNeeded = true
-      apiDisabled = false
       notice = "Google authorization needed"
       noticeIsError = true
     }
   }
 
+  function refreshAuth() {
+    if (authChecking) return
+    authChecking = true
+    enqueue({
+      priority: true,
+      argv: root.backendCommand.concat(["status"]),
+      onDone: function(code, out, err) {
+        authChecking = false
+        if (code !== 0) {
+          if (loginPending) {
+            notice = "GNOME Online Accounts is unavailable"
+            noticeIsError = true
+          }
+          return
+        }
+        var state = null
+        try { state = JSON.parse(out) } catch (e) { state = null }
+        accounts = state && Array.isArray(state.accounts) ? state.accounts : []
+        if (loginPending && hasAccount) {
+          loginPending = false
+          authNeeded = false
+          notice = ""
+          noticeIsError = false
+          refreshAll()
+        } else if (hasAccount && !authNeeded && !primed) {
+          refreshAll()
+        }
+      }
+    })
+  }
+
   Process {
     id: apiProc
-    environment: ({ "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": root.profileDir })
+    clearEnvironment: true
+    environment: ({
+      "HOME": root.home,
+      "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR") || "",
+      "DBUS_SESSION_BUS_ADDRESS": Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || ""
+    })
     command: ["true"]
     // waitForEnd makes the collectors finish before onExited runs, so finishOp
     // always sees this process's own output rather than the previous one's.
@@ -242,6 +279,14 @@ Panel {
     }
   }
 
+  Timer {
+    id: authWatch
+    interval: 2000
+    repeat: true
+    running: root.loginPending
+    onTriggered: root.refreshAuth()
+  }
+
   Process {
     id: mkdirProc
     command: ["mkdir", "-p", root.cacheDir]
@@ -252,7 +297,7 @@ Panel {
   function fetchLists() {
     fetchInFlight = true
     enqueue({
-      argv: ["gws", "tasks", "tasklists", "list"],
+      argv: root.backendCommand.concat(["tasklists", "list"]),
       onDone: function(code, out, err) {
         fetchInFlight = false
         if (code !== 0) {
@@ -261,7 +306,6 @@ Panel {
         }
         if (authNeeded) {
           authNeeded = false
-          apiDisabled = false
           notice = ""
         }
         var ls = Tasks.parseTasklists(out)
@@ -293,14 +337,14 @@ Panel {
   function enqueueFetch(listId, priority) {
     enqueue({
       priority: priority === true,
-      argv: ["gws", "tasks", "tasks", "list",
+      argv: root.backendCommand.concat(["tasks", "list",
         "--params", JSON.stringify({
           tasklist: listId,
           showCompleted: true,
           showHidden: false,
           maxResults: 100
         }),
-        "--page-all", "--page-limit", "3"],
+         "--page-all", "--page-limit", "3"]),
       onDone: function(code, out, err) {
         if (code !== 0) return
         var next = {}
@@ -315,7 +359,7 @@ Panel {
   }
 
   function refreshAll() {
-    if (!hasSecret) return
+    if (!hasAccount) return
     if (fetchInFlight) return
     primed = true
     notice = ""
@@ -324,7 +368,7 @@ Panel {
 
   Timer {
     interval: Math.max(15, root.autoRefreshSec) * 1000
-    running: root.opened && root.autoRefreshSec > 0 && root.hasSecret
+    running: root.opened && root.autoRefreshSec > 0 && root.hasAccount
     repeat: true
     onTriggered: root.refreshAll()
   }
@@ -376,9 +420,9 @@ Panel {
   function enqueuePatch(taskId, body, listId) {
     enqueue({
       priority: true,
-      argv: ["gws", "tasks", "tasks", "patch",
+      argv: root.backendCommand.concat(["tasks", "patch",
         "--params", JSON.stringify({ tasklist: listId, task: taskId }),
-        "--json", JSON.stringify(body)],
+        "--json", JSON.stringify(body)]),
       onDone: function(code, out, err) {
         if (code !== 0) {
           notice = "Update failed — reloading"
@@ -407,9 +451,9 @@ Panel {
     if (task.parent) body.parent = task.parent
     enqueue({
       priority: true,
-      argv: ["gws", "tasks", "tasks", "update",
+      argv: root.backendCommand.concat(["tasks", "update",
         "--params", JSON.stringify({ tasklist: listId, task: task.id }),
-        "--json", JSON.stringify(body)],
+        "--json", JSON.stringify(body)]),
       onDone: function(code, out, err) {
         if (code !== 0) {
           notice = "Update failed — reloading"
@@ -444,9 +488,9 @@ Panel {
     if (due !== "") body.due = due
     enqueue({
       priority: true,
-      argv: ["gws", "tasks", "tasks", "insert",
-        "--params", JSON.stringify({ tasklist: listId }),
-        "--json", JSON.stringify(body)],
+        argv: root.backendCommand.concat(["tasks", "insert",
+          "--params", JSON.stringify({ tasklist: listId }),
+          "--json", JSON.stringify(body)]),
       onDone: function(code, out, err) {
         if (code !== 0) {
           notice = "Could not add task"
@@ -521,8 +565,8 @@ Panel {
       removeTaskLocal(taskId)
       enqueue({
         priority: true,
-        argv: ["gws", "tasks", "tasks", "delete",
-          "--params", JSON.stringify({ tasklist: listId, task: taskId })],
+          argv: root.backendCommand.concat(["tasks", "delete",
+            "--params", JSON.stringify({ tasklist: listId, task: taskId })]),
         onDone: function(code, out, err) {
           if (code !== 0) {
             notice = "Delete failed"
@@ -535,8 +579,8 @@ Panel {
       var lid = currentListId
       enqueue({
         priority: true,
-        argv: ["gws", "tasks", "tasks", "clear",
-          "--params", JSON.stringify({ tasklist: lid })],
+        argv: root.backendCommand.concat(["tasks", "clear",
+          "--params", JSON.stringify({ tasklist: lid })]),
         onDone: function(code, out, err) {
           if (code !== 0) {
             notice = "Clear failed"
@@ -595,7 +639,7 @@ Panel {
     var listId = currentListId
     enqueue({
       priority: true,
-      argv: ["gws", "tasks", "tasks", "move", "--params", JSON.stringify(params)],
+      argv: root.backendCommand.concat(["tasks", "move", "--params", JSON.stringify(params)]),
       onDone: function(code, out, err) {
         if (code !== 0) {
           notice = "Reorder failed"
@@ -833,8 +877,8 @@ Panel {
       notice: notice,
       noticeIsError: noticeIsError,
       authNeeded: authNeeded,
-      apiDisabled: apiDisabled,
-      hasSecret: hasSecret,
+      hasAccount: hasAccount,
+      accounts: accounts,
       busy: busy,
       queued: opQueue.length,
       lists: lists.length,
@@ -867,11 +911,13 @@ Panel {
     cursor = 0
   }
 
-  function launchSetup() {
-    var scriptPath = decodeURIComponent(Qt.resolvedUrl("setup.sh").toString().replace(/^file:\/\//, ""))
-    // An argv vector, not a shell string: a HOME containing a space or a quote
-    // would otherwise break the command or inject into it.
-    Util.execArgv(["omarchy-launch-tui", "--app-id=org.omarchy.gtasks-setup", "bash", scriptPath])
+  function launchLogin() {
+    loginPending = true
+    authNeeded = false
+    notice = "Waiting for Google account…"
+    noticeIsError = false
+    Quickshell.execDetached(["/usr/bin/gnome-online-accounts-gtk"])
+    refreshAuth()
   }
 
   // ------------------------------------------------------------- popup surface
@@ -1525,7 +1571,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: {
               if (root.notice !== "") return root.notice
-              if (!root.hasSecret) return "not signed in"
+              if (!root.hasAccount) return "not signed in"
               if (root.busy) return "syncing…"
               if (root.lastSyncedAt > 0) return "synced " + Qt.formatTime(new Date(root.lastSyncedAt), "HH:mm")
               return ""
@@ -1540,7 +1586,7 @@ Panel {
       Rectangle {
         id: signInOverlay
         anchors.fill: parent
-        visible: root.authNeeded || (!root.hasSecret && root.noDataYet)
+        visible: root.authNeeded || (!root.hasAccount && root.noDataYet)
         color: Qt.alpha(Color.background, 0.93)
         radius: Style.cornerRadius
 
@@ -1562,9 +1608,11 @@ Panel {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
-            text: root.apiDisabled
-              ? "The Google Tasks API is not enabled\nfor your GCP project yet.\nEnable it, then retry."
-              : "Connect your Google account\nto load your task lists."
+            text: root.authNeeded
+              ? "Reconnect your Google account\nin GNOME Online Accounts."
+              : (root.loginPending
+                ? "Waiting for the Google account\nto appear in GNOME Online Accounts."
+                : "Connect your Google account\nto load your task lists.")
             color: Color.popups.text
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -1580,7 +1628,7 @@ Panel {
             border.color: Style.normalBorderColor
             Text {
               anchors.centerIn: parent
-              text: "Sign in with Google"
+              text: "Add Google account"
               color: Color.popups.text
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -1590,7 +1638,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.launchSetup()
+              onClicked: root.launchLogin()
             }
           }
 
@@ -1599,7 +1647,7 @@ Panel {
             width: Style.space(120)
             height: Style.spacing.controlHeight
             radius: Style.cornerRadius / 2
-            visible: root.hasSecret
+              visible: root.hasAccount || root.authNeeded
             color: maRetry.containsMouse ? Style.hoverFill : "transparent"
             border.width: Style.normalBorderWidth
             border.color: Style.normalBorderColor
@@ -1618,18 +1666,10 @@ Panel {
               onClicked: {
                 root.authNeeded = false
                 root.notice = ""
-                root.refreshAll()
+                if (root.hasAccount) root.refreshAll()
+                else root.launchLogin()
               }
             }
-          }
-
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            visible: root.apiDisabled
-            text: "console.cloud.google.com → APIs & Services → Google Tasks API"
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
           }
         }
       }
